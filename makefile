@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -pthread
+CFLAGS = -g -Wall -pthread
 TARGET = pagerank
 
 SRCS = PagerankMultiThread.c
