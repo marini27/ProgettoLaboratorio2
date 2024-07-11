@@ -40,9 +40,11 @@ typedef struct {
     int size;
     int in;
     int out;
+    int fd;
     sem_t empty;
     sem_t full;
     pthread_mutex_t mutex;
+    pthread_cond_t lock;
 } SharedBuffer;
 
 typedef struct {
@@ -101,6 +103,7 @@ typedef struct {
     double *ranks;
     int num_nodes;
     pthread_mutex_t *lock;
+    int calculation_started;
 } SignalThreadData;
 
 volatile sig_atomic_t print_info = 0;
@@ -169,7 +172,21 @@ void initSharedBuffer(SharedBuffer *sharedBuffer, int size) {
     sharedBuffer->in = 0;
     sharedBuffer->out = 0;
 
-    sharedBuffer->buffer = mmap(NULL, size * sizeof(Arco), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    //inizializzo la memoria condivisa con shm_open e ftruncate
+    int fd = shm_open("/shared_buffer", O_CREAT | O_RDWR, 0666);
+    if (fd == -1) {
+        perror("shm_open failed");
+        exit(EXIT_FAILURE);
+    }
+    if (ftruncate(fd, size * sizeof(Arco)) == -1) {
+        perror("ftruncate failed");
+        exit(EXIT_FAILURE);
+    }
+
+    sharedBuffer->fd = fd;
+    
+
+    sharedBuffer->buffer = mmap(NULL, size * sizeof(Arco), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (sharedBuffer->buffer == MAP_FAILED) {
         perror("mmap failed");
         exit(EXIT_FAILURE);
@@ -178,15 +195,19 @@ void initSharedBuffer(SharedBuffer *sharedBuffer, int size) {
     sem_init(&sharedBuffer->empty, 1, size);
     sem_init(&sharedBuffer->full, 1, 0);
     pthread_mutex_init(&sharedBuffer->mutex, NULL);
+    pthread_cond_init(&sharedBuffer->lock, NULL);
     printf("Shared buffer initialized with size %d\n", size);
 }
 
 //distruggo il buffer condiviso
 void destroySharedBuffer(SharedBuffer *sharedBuffer) {
+    shm_unlink("/shared_buffer");
     munmap(sharedBuffer->buffer, sharedBuffer->size * sizeof(Arco));
+    close(sharedBuffer->fd);
     sem_destroy(&sharedBuffer->empty);
     sem_destroy(&sharedBuffer->full);
     pthread_mutex_destroy(&sharedBuffer->mutex);
+    pthread_cond_destroy(&sharedBuffer->lock);
     printf("Shared buffer destroyed\n");
 }
 
@@ -194,12 +215,14 @@ void destroySharedBuffer(SharedBuffer *sharedBuffer) {
 void produce(ThreadPool *pool, Arco arco) {
     SharedBuffer *sharedBuffer = pool->task_queue;
     sem_wait(&sharedBuffer->empty);
-    pthread_mutex_lock(&sharedBuffer->mutex);
+    //pthread_mutex_lock(&sharedBuffer->mutex);
 
     sharedBuffer->buffer[sharedBuffer->in] = arco;
     sharedBuffer->in = (sharedBuffer->in + 1) % sharedBuffer->size;
+    pthread_cond_signal(&sharedBuffer->lock);
+    //fprintf(stderr, "Produced arc (%d, %d) by capolettore thread: %ld\n", arco.src, arco.dest, pthread_self());
 
-    pthread_mutex_unlock(&sharedBuffer->mutex);
+    //pthread_mutex_unlock(&sharedBuffer->mutex);
     sem_post(&sharedBuffer->full);
     //printf("Produced arc (%d, %d) by capolettore thread: %ld\n", arco.src, arco.dest, pthread_self());
 }
@@ -212,10 +235,21 @@ Arco consume(ThreadPool *pool) {
 
     Arco arco = sharedBuffer->buffer[sharedBuffer->out];
     sharedBuffer->out = (sharedBuffer->out + 1) % sharedBuffer->size;
+    //fprintf(stderr, "Consumed arc (%d, %d) by thread: %ld\n", arco.src, arco.dest, pthread_self());
 
     pthread_mutex_unlock(&sharedBuffer->mutex);
     sem_post(&sharedBuffer->empty);
     return arco;
+}
+
+//funzione chiamata da threadfunction per aggiungere un arco al grafo
+void addEdge(grafo *g, int src, int dest) {
+    Node *newNode = (Node *)malloc(sizeof(Node));
+    newNode->dest = src;
+    newNode->next = g->in[dest];
+    g->in[dest] = newNode;
+    g->out[src]++;
+    //printf("Edge added: %d -> %d\n", src, dest);
 }
 
 //funzione eseguita dai thread ausiliari per consumare gli archi dal buffer condiviso e aggiungerli al grafo
@@ -233,7 +267,9 @@ void *thread_function(void *arg) {
             addEdge(pool->g, arco.src, arco.dest);
             pthread_mutex_unlock(&pool->g->lock);
         }
-        usleep(1);
+        while(pthread_cond_signal(&pool->task_queue->lock) != 0){
+            pthread_cond_wait(&pool->task_queue->lock, &pool->task_queue->mutex);
+        }
     }
     return NULL;
 }
@@ -254,7 +290,6 @@ void threadPoolDestroy(ThreadPool *pool) {
     for (int i = 0; i < pool->num_aux_threads; i++) {
         pthread_join(pool->aux_threads[i], NULL);
     }
-    
     free(pool->aux_threads);
     pthread_mutex_destroy(&pool->g->lock);
     printf("Thread pool destroyed\n");
@@ -265,7 +300,6 @@ void *funzione_capolettore(void *arg) {
     ThreadData *data = (ThreadData *)arg;
     grafo *g = data->g;
     ThreadPool *pool = data->pool;
-    SharedBuffer *task_queue = pool->task_queue;
 
     FILE *file = fopen(data->filename, "r");
     if (file == NULL) {
@@ -320,16 +354,6 @@ void *funzione_capolettore(void *arg) {
     printf("File letto\n");
 }
 
-//funzione chiamata da threadfunction per aggiungere un arco al grafo
-void addEdge(grafo *g, int src, int dest) {
-    Node *newNode = (Node *)malloc(sizeof(Node));
-    newNode->dest = src;
-    newNode->next = g->in[dest];
-    g->in[dest] = newNode;
-    g->out[src]++;
-    //printf("Edge added: %d -> %d\n", src, dest);
-}
-
 //funzione per liberare la memoria allocata per il grafo
 void freeGraph(grafo *g) {
     for (int i = 0; i < g->N; i++) {
@@ -354,29 +378,33 @@ void *signal_thread(void *arg) {
 
     sigemptyset(&set);
     sigaddset(&set, SIGUSR1);
-    fprintf(stderr, "Signal thread started, il mio pid è: \n, %d", getpid());
+    fprintf(stderr, "Signal thread started, il mio pid è: %d\n", getpid());
 
     while (1) {
         sigwait(&set, &sig);
         fprintf(stderr, "Segnale ricevuto = %d\n", sig);
 
         if (sig == SIGUSR1) {
-            pthread_mutex_lock(data->lock);
+            if ((data->calculation_started)) {
+                pthread_mutex_lock(data->lock);
 
-            int max_index = 0;
-            double max_rank = data->ranks[0];
-            for (int i = 1; i < data->num_nodes; i++) {
-                if (data->ranks[i] > max_rank) {
-                    max_rank = data->ranks[i];
-                    max_index = i;
+                int max_index = 0;
+                double max_rank = data->ranks[0];
+                for (int i = 1; i < data->num_nodes; i++) {
+                    if (data->ranks[i] > max_rank) {
+                        max_rank = data->ranks[i];
+                        max_index = i;
+                    }
                 }
+
+                fprintf(stderr, "Iterazione corrente: %d\n", *data->iterations);
+                fprintf(stderr, "Nodo con il maggiore PageRank: %d\n", max_index);
+                fprintf(stderr, "Valore del PageRank: %f\n", max_rank);
+
+                pthread_mutex_unlock(data->lock);
+            } else {
+                fprintf(stderr, "Errore: il calcolo del PageRank non è ancora iniziato.\n");
             }
-
-            fprintf(stderr, "Iterazione corrente: %d\n", *data->iterations);
-            fprintf(stderr, "Nodo con il maggiore PageRank: %d\n", max_index);
-            fprintf(stderr, "Valore del PageRank: %f\n", max_rank);
-
-            pthread_mutex_unlock(data->lock);
         }
     }
 
@@ -452,7 +480,7 @@ void *pagerank_thread(void *arg) {
 }
 
 //funzione che divide il lavoro tra i thread per calcolare il pagerank in parallelo
-PageRankResult pagerank_parallel(grafo *g, int num_nodes, double damping, double epsilon, int maxiter, int num_threads) {
+PageRankResult pagerank_parallel(grafo *g, int num_nodes, double damping, double epsilon, int maxiter, int num_threads, SignalThreadData *signal_data) {
     printf("Calcolo del pagerank con %d nodi, damping %.2f, epsilon %.2e, maxiter %d, %d threads\n", num_nodes, damping, epsilon, maxiter, num_threads);
     double *ranks = (double *)malloc(num_nodes * sizeof(double));
     double *old_ranks = (double *)malloc(num_nodes * sizeof(double));
@@ -460,7 +488,7 @@ PageRankResult pagerank_parallel(grafo *g, int num_nodes, double damping, double
     double *delta = (double *)malloc(sizeof(double));
     double init_rank = 1.0 / num_nodes;
     pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
-    pthread_t signal_thread_id;
+    //pthread_t signal_thread_id;
 
     for (int i = 0; i < num_nodes; i++) {
         ranks[i] = init_rank;
@@ -472,15 +500,14 @@ PageRankResult pagerank_parallel(grafo *g, int num_nodes, double damping, double
     pthread_barrier_init(&barrier, NULL, num_threads);
     pthread_mutex_t lock;
     pthread_mutex_init(&lock, NULL);
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGUSR1);
-    pthread_sigmask(SIG_BLOCK, &set, NULL);
     int iterations = 0;
     int stop_flag = 0;
 
-    SignalThreadData signal_data = { &iterations, ranks, num_nodes, &lock };
-    pthread_create(&signal_thread_id, NULL, signal_thread, &signal_data);
+    signal_data->ranks = ranks;
+    signal_data->num_nodes = num_nodes;
+    signal_data->lock = &lock;
+    signal_data->calculation_started = 1;
+    signal_data->iterations = &iterations;
 
     memcpy(old_ranks, ranks, num_nodes * sizeof(double));
     *sum_dead_ends = 0.0;
@@ -519,9 +546,6 @@ PageRankResult pagerank_parallel(grafo *g, int num_nodes, double damping, double
         pthread_join(threads[i], NULL);
     }
 
-    pthread_cancel(signal_thread_id);
-    pthread_join(signal_thread_id, NULL);
-
     double total_rank = 0.0;
     for (int i = 0; i < num_nodes; i++) {
         total_rank += ranks[i];
@@ -540,10 +564,13 @@ PageRankResult pagerank_parallel(grafo *g, int num_nodes, double damping, double
     free(threads);
     free(thread_data);
     free(local_deltas);
+    free(delta);
+    pthread_mutex_destroy(&lock);
     pthread_barrier_destroy(&barrier);
 
     return result;
 }
+
 
 int main(int argc, char *argv[]) {
     // Valori di default
@@ -587,6 +614,15 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    pthread_t signal_thread_id;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    SignalThreadData signal_data = {NULL, NULL, 0, NULL, 0};
+    pthread_create(&signal_thread_id, NULL, signal_thread, &signal_data);
+
     // Inizializzazione grafo e altre strutture
     grafo *g = (grafo *)malloc(sizeof(grafo));
     SharedBuffer task_queue;
@@ -596,6 +632,7 @@ int main(int argc, char *argv[]) {
     data.g = g;
     data.filename = infile;
     data.num_threads = T;
+
 
     ThreadPool pool;
     threadPoolInit(&pool, T, &task_queue, g);
@@ -622,7 +659,7 @@ int main(int argc, char *argv[]) {
     destroySharedBuffer(&task_queue);
 
     // Calcolo del PageRank parallelo
-    PageRankResult result = pagerank_parallel(g, g->N, D, E, M, T);
+    PageRankResult result = pagerank_parallel(g, g->N, D, E, M, T, &signal_data);
 
     // Stampa delle statistiche del grafo
     int num_deadends = 0;
@@ -663,6 +700,9 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < K && i < g->N; ++i) {
         printf("  Node %d: rank = %.6f\n", indices[i], result.ranks[indices[i]]);
     }
+
+    pthread_cancel(signal_thread_id);
+    pthread_join(signal_thread_id, NULL);
 
     // Libera la memoria allocata
     free(indices);

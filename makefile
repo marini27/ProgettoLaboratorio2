@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -pthread
+CFLAGS = -Wall -pthread
 TARGET = pagerank
 
 SRCS = PagerankMultiThread.c
@@ -11,7 +11,7 @@ OBJS = $(SRCS:.c=.o)
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET) -lm
+	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET) -lm -lrt
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
