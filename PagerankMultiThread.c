@@ -192,6 +192,7 @@ void initSharedBuffer(SharedBuffer *sharedBuffer, int size) {
         exit(EXIT_FAILURE);
     }
 
+
     sem_init(&sharedBuffer->empty, 1, size);
     sem_init(&sharedBuffer->full, 1, 0);
     pthread_mutex_init(&sharedBuffer->mutex, NULL);
@@ -201,9 +202,9 @@ void initSharedBuffer(SharedBuffer *sharedBuffer, int size) {
 
 //distruggo il buffer condiviso
 void destroySharedBuffer(SharedBuffer *sharedBuffer) {
+    close(sharedBuffer->fd);
     shm_unlink("/shared_buffer");
     munmap(sharedBuffer->buffer, sharedBuffer->size * sizeof(Arco));
-    close(sharedBuffer->fd);
     sem_destroy(&sharedBuffer->empty);
     sem_destroy(&sharedBuffer->full);
     pthread_mutex_destroy(&sharedBuffer->mutex);
@@ -352,6 +353,8 @@ void *funzione_capolettore(void *arg) {
     }
     fclose(file);
     printf("File letto\n");
+
+    return NULL;
 }
 
 //funzione per liberare la memoria allocata per il grafo
